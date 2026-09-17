@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 node_modules/
 .env
 *.db
@@ -5,3 +6,6 @@ dist/
 .vite/
 coverage/
 .DS_Store
+=======
+main
+>>>>>>> e6c39c0faa93e9c0534b67ce22b07cf5ca54ac85
