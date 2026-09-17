@@ -1,22 +1,697 @@
-# REASONING
+# TiffinTrack — Engineering Reasoning
 
-## Core architecture
-React + Vite frontend, Express REST API, Prisma ORM and SQLite.
+## 1. Overview
 
-## Billing
-Pause history is persisted separately from current subscription status because current ACTIVE/PAUSED state cannot reconstruct historical service days.
+TiffinTrack is a full-stack web application designed for home-style tiffin services.
 
-## T1
-`POST /api/clock` is a deterministic morning trigger for the assessment. It checks weekday, active status, subscription start and pause history. Eligible notifications are stored in `NotificationOutbox`, making the integration observable through `/api/notifications/outbox`.
+The main goal is to make subscription management and monthly billing simple for the tiffin owner while ensuring that customers are charged only for the weekdays on which they were actually served.
 
-## T6
-Changing only `Subscription.customerId` would destroy historical ownership. `SubscriptionAssignment` stores start/end intervals so the billing engine can calculate which customer was served on each part of the cycle.
+The application was designed around the core workflow:
 
-## T4
-The importer is a normalize → validate → deduplicate → persist pipeline. Phone is the identity key. Common date formats are converted to ISO date-only values. Invalid records are rejected with row numbers.
+```text
+Customer
+   ↓
+Monthly Subscription
+   ↓
+Pause / Resume
+   ↓
+Actual Served Days
+   ↓
+Pro-Rated Monthly Bill
+```
 
-## Authentication
-Users have OWNER or CUSTOMER roles. Owners can manage the whole service; customers are restricted to their own `/api/my-account`.
+Additional assessment functionality was implemented without changing the core billing model:
 
-## Trade-offs
-The timed assessment favors a small dependency footprint. SQLite is appropriate for a demo-scale builder round. A production implementation would use a worker-backed notification queue and a robust CSV parser.
+```text
+Daily Delivery Notifications
+Subscription Transfer
+Messy Customer Import
+```
+
+---
+
+# 2. Technology Selection
+
+## Frontend — React + Vite
+
+React was selected because the application requires multiple interactive views such as:
+
+* Login
+* Dashboard
+* Customer list
+* Customer details
+* Subscription management
+* Billing
+* Customer account
+* CSV import
+
+Vite provides a lightweight development environment and fast frontend startup.
+
+---
+
+## Backend — Node.js + Express
+
+Express was selected for the REST API because the application has several independent operations:
+
+* Authentication
+* Customer management
+* Subscription management
+* Pause/resume
+* Billing
+* Notifications
+* Import
+
+Keeping these operations behind a REST API also makes the frontend independent of the business logic.
+
+---
+
+## Database — SQLite + Prisma
+
+SQLite was selected because the assessment has a strict time constraint and does not require a separate database server.
+
+Prisma provides:
+
+* Schema definition
+* Migrations
+* Type-safe database access
+* Relationship handling
+* Simple development setup
+
+For production, PostgreSQL would be a more suitable database choice.
+
+---
+
+# 3. Database Design
+
+The database contains the following main entities:
+
+```text
+User
+ │
+ └── Customer
+       │
+       └── Subscription
+             │
+             ├── Pause
+             │
+             └── SubscriptionAssignment
+
+NotificationOutbox
+```
+
+## User
+
+Stores authentication information.
+
+Important fields:
+
+* `id`
+* `name`
+* `email`
+* `passwordHash`
+* `role`
+
+Two roles are supported:
+
+```text
+OWNER
+CUSTOMER
+```
+
+---
+
+## Customer
+
+Stores customer information.
+
+Important fields:
+
+* `name`
+* `phone`
+* `userId`
+
+Phone numbers are unique so that the same customer cannot accidentally be created multiple times using the same normalized phone number.
+
+---
+
+## Subscription
+
+Stores the customer's monthly plan.
+
+Important fields:
+
+* `customerId`
+* `monthlyPrice`
+* `startDate`
+* `status`
+
+The status represents the current state of the subscription.
+
+```text
+ACTIVE
+PAUSED
+```
+
+---
+
+## Pause
+
+Pause history is stored separately from the subscription's current status.
+
+This is important because billing needs historical information.
+
+For example, if a customer was paused from September 10 to September 12 and later resumed, those dates must still remain excluded from the September bill.
+
+Therefore, the system does not rely only on:
+
+```text
+subscription.status
+```
+
+for historical billing.
+
+---
+
+## SubscriptionAssignment
+
+This table was introduced to support mid-cycle subscription transfers.
+
+Instead of changing the customer and losing historical ownership, the system stores ownership periods.
+
+Example:
+
+```text
+Subscription #10
+
+Customer A
+01 Sep → 15 Sep
+
+Customer B
+16 Sep → 30 Sep
+```
+
+This allows billing to determine who was responsible for each served day.
+
+---
+
+## NotificationOutbox
+
+The notification outbox stores delivery notification events generated by the daily clock operation.
+
+It provides a deterministic way to verify notification generation without requiring an external SMS or WhatsApp service.
+
+---
+
+# 4. Billing Logic
+
+Billing is the most important business rule in the application.
+
+The system treats Monday through Friday as billable delivery days.
+
+For a billing month:
+
+1. Determine the weekdays in the month.
+2. Consider the subscription start date.
+3. Remove weekdays that fall inside pause periods.
+4. Determine the actual served weekdays.
+5. Apply the pro-rata formula.
+
+The formula is:
+
+```text
+Bill =
+Monthly Price ×
+Served Weekdays / Total Billable Weekdays
+```
+
+---
+
+## Example
+
+Suppose:
+
+```text
+Monthly plan = ₹3000
+Month = September 2026
+Total weekdays = 22
+Paused weekdays = 2
+Served weekdays = 20
+```
+
+Then:
+
+```text
+Bill = 3000 × 20 / 22
+     = ₹2727.27
+```
+
+This ensures that a customer is not charged for weekdays on which the tiffin was paused.
+
+---
+
+# 5. Why Pause History Is Separate
+
+A subscription's current status does not provide enough information for historical billing.
+
+For example:
+
+```text
+Sep 1     ACTIVE
+Sep 10    PAUSED
+Sep 12    PAUSED
+Sep 13    ACTIVE
+```
+
+If the customer is currently active, looking only at the current status would incorrectly count September 10–12 as served.
+
+Therefore, every pause period is stored in the `Pause` table.
+
+Billing checks whether each delivery date falls within any recorded pause period.
+
+Pause ranges are inclusive.
+
+---
+
+# 6. Subscription Transfer Reasoning
+
+A subscription transfer changes the customer receiving the service, but it should not erase historical ownership.
+
+For example:
+
+```text
+Subscription
+₹3000/month
+
+Customer A:
+September 1 → September 15
+
+Customer B:
+September 16 → September 30
+```
+
+The subscription remains the same subscription.
+
+Only its ownership changes.
+
+Therefore, a `SubscriptionAssignment` record is created for each ownership period.
+
+When a transfer happens:
+
+1. Find the current assignment.
+2. End it one day before the transfer date.
+3. Create a new assignment beginning on the transfer date.
+4. Update the subscription's current customer.
+5. Use assignment periods during billing.
+
+This preserves historical information while keeping the current subscription lookup simple.
+
+---
+
+# 7. Daily Delivery Notification Reasoning
+
+The daily delivery requirement is implemented using:
+
+```http
+POST /api/clock
+```
+
+The endpoint accepts a date.
+
+The system checks:
+
+```text
+Is it Monday-Friday?
+        ↓
+Has the subscription started?
+        ↓
+Is the subscription ACTIVE?
+        ↓
+Is the date outside all pause periods?
+        ↓
+Create notification
+```
+
+Eligible notifications are written to `NotificationOutbox`.
+
+This approach was selected instead of integrating an external messaging provider because the assessment requires demonstrating the notification workflow rather than actually sending SMS or WhatsApp messages.
+
+The outbox also makes the behavior easy to test and inspect.
+
+---
+
+# 8. Messy Customer Import Reasoning
+
+Real customer data can contain:
+
+* Duplicate phone numbers
+* Different phone formats
+* Different date formats
+* Missing values
+* Invalid records
+
+The import pipeline therefore follows:
+
+```text
+CSV
+ ↓
+Parse
+ ↓
+Normalize
+ ↓
+Validate
+ ↓
+Deduplicate
+ ↓
+Create records
+ ↓
+Generate report
+```
+
+Phone numbers are normalized before duplicate detection.
+
+Supported date formats include:
+
+```text
+YYYY-MM-DD
+YYYY/MM/DD
+DD/MM/YYYY
+DD-MM-YYYY
+```
+
+Rows that cannot be validated are rejected rather than creating incomplete database records.
+
+The import result reports:
+
+```text
+imported
+deduped
+rejected
+errors
+```
+
+This gives the owner visibility into what happened during an import.
+
+---
+
+# 9. Authentication Reasoning
+
+Authentication uses:
+
+```text
+bcrypt
++
+JWT
+```
+
+Passwords are never stored directly.
+
+Instead:
+
+```text
+Password
+   ↓
+bcrypt hash
+   ↓
+Database
+```
+
+During login:
+
+```text
+Email + Password
+       ↓
+Verify bcrypt hash
+       ↓
+Generate JWT
+       ↓
+Authenticated requests
+```
+
+Role information is included in the authentication flow so that owners and customers receive different access levels.
+
+---
+
+# 10. API Design
+
+The backend is organized into:
+
+```text
+Routes
+   ↓
+Controllers
+   ↓
+Services
+   ↓
+Prisma
+   ↓
+SQLite
+```
+
+Routes define the HTTP interface.
+
+Controllers handle request/response behavior.
+
+Services contain business logic.
+
+Prisma handles database access.
+
+This separation prevents business logic from becoming tightly coupled to HTTP handlers.
+
+---
+
+# 11. Pagination and Sorting
+
+Customer search supports:
+
+```text
+page
+limit
+search
+sort
+order
+```
+
+Example:
+
+```http
+GET /api/customers?page=1&limit=10&search=Rahul&sort=name&order=asc
+```
+
+Search can be performed using customer name or phone.
+
+Sorting fields are controlled using an allow-list instead of directly accepting arbitrary database fields.
+
+This reduces accidental or unsafe query behavior.
+
+---
+
+# 12. Frontend Reasoning
+
+The frontend is divided into separate pages based on user responsibilities.
+
+### Public
+
+```text
+/
+ /login
+ /register
+```
+
+### Owner
+
+```text
+/dashboard
+/customers
+/customers/:id
+/import
+```
+
+### Customer
+
+```text
+/my-account
+```
+
+The landing page is intentionally customer-facing.
+
+Internal assessment terminology and implementation details are not required for a normal customer using the product.
+
+---
+
+# 13. Error Handling
+
+The backend returns HTTP status codes according to the operation result.
+
+Examples include:
+
+```text
+400 — Invalid request
+401 — Authentication required
+403 — Insufficient permissions
+404 — Resource not found
+409 — Duplicate/conflicting data
+500 — Unexpected server error
+```
+
+This allows the frontend to distinguish validation problems from authentication or server errors.
+
+---
+
+# 14. Testing Strategy
+
+The most important business logic was separated into testable services.
+
+Tests cover:
+
+### Billing
+
+* Weekday calculation
+* Pause exclusion
+* Pro-rated calculation
+
+### Notifications
+
+* Weekday eligibility
+* Active subscription requirement
+* Pause exclusion
+
+### Import
+
+* Phone normalization
+* Date normalization
+* Duplicate detection
+* Invalid rows
+
+The tests are located under:
+
+```text
+backend/test/
+```
+
+and can be executed using:
+
+```bash
+npm test
+```
+
+---
+
+# 15. Security Considerations
+
+The implementation includes basic security practices:
+
+* Password hashing with bcrypt
+* JWT authentication
+* Role-based authorization
+* Environment variables for secrets
+* `.env` excluded from Git
+* Input validation
+* Controlled sorting fields
+
+For production, additional measures would be required, including:
+
+* Rate limiting
+* Strong secret management
+* Refresh token rotation
+* CSRF protection where applicable
+* More comprehensive input schemas
+* Audit logging
+* HTTPS
+* Database backups
+
+---
+
+# 16. Assessment Time Constraint
+
+The application was designed with the assessment's limited development window in mind.
+
+The implementation intentionally avoids unnecessary infrastructure.
+
+For example:
+
+```text
+SQLite
+instead of
+separate PostgreSQL server
+```
+
+and:
+
+```text
+Notification Outbox
+instead of
+external SMS provider
+```
+
+This keeps the core functionality demonstrable while maintaining a structure that could be extended for production.
+
+---
+
+# 17. Key Engineering Trade-offs
+
+## SQLite vs PostgreSQL
+
+SQLite simplifies local development and assessment setup.
+
+PostgreSQL would be preferable for a production multi-user deployment.
+
+---
+
+## Outbox vs External Notification Provider
+
+The outbox provides deterministic assessment verification.
+
+A production implementation could process the outbox asynchronously using a worker and an external notification service.
+
+---
+
+## Current Status vs Historical Events
+
+The subscription status represents the current state.
+
+Pause and assignment tables represent historical state.
+
+This separation prevents historical billing from being corrupted by current subscription status.
+
+---
+
+## Simple Frontend vs Large UI Framework
+
+The frontend uses React with lightweight CSS rather than a large component framework.
+
+This reduces dependencies and keeps the application easy to modify during a short assessment.
+
+---
+
+# 18. Future Improvements
+
+Potential production improvements include:
+
+1. PostgreSQL migration
+2. Real SMS/WhatsApp notification integration
+3. Online payments
+4. Delivery staff and route management
+5. Automated daily notification workers
+6. Better audit history
+7. Advanced reporting
+8. Docker deployment
+9. CI/CD pipeline
+10. Automated database backups
+
+---
+
+# 19. Final Design Principle
+
+The main design principle behind TiffinTrack is:
+
+> **Store the events that affect billing instead of relying only on the current state.**
+
+Subscriptions represent the current plan.
+
+Pause records represent periods when service was stopped.
+
+Assignment records represent historical subscription ownership.
+
+Together, these records allow the system to calculate what actually happened during a billing period rather than making assumptions from the customer's current status.
+
+This makes the billing logic transparent, testable, and extensible.
