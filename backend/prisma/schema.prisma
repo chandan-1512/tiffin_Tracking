@@ -1,0 +1,88 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  OWNER
+  CUSTOMER
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  PAUSED
+}
+
+model User {
+  id           Int       @id @default(autoincrement())
+  name         String
+  email        String    @unique
+  passwordHash String
+  role         UserRole  @default(OWNER)
+  customer     Customer?
+  createdAt    DateTime  @default(now())
+}
+
+model Customer {
+  id            Int                      @id @default(autoincrement())
+  userId        Int?                     @unique
+  name          String
+  phone         String                   @unique
+  createdAt     DateTime                 @default(now())
+  updatedAt     DateTime                 @updatedAt
+  user          User?                    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  subscriptions Subscription[]
+  assignments   SubscriptionAssignment[]
+}
+
+model Subscription {
+  id           Int                      @id @default(autoincrement())
+  customerId   Int
+  monthlyPrice Float
+  startDate    DateTime
+  status       SubscriptionStatus       @default(ACTIVE)
+  createdAt    DateTime                 @default(now())
+  updatedAt    DateTime                 @updatedAt
+  customer     Customer                 @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  pauses       Pause[]
+  assignments  SubscriptionAssignment[]
+  @@index([customerId])
+  @@index([status])
+}
+
+model SubscriptionAssignment {
+  id             Int          @id @default(autoincrement())
+  subscriptionId Int
+  customerId     Int
+  startDate      DateTime
+  endDate        DateTime?
+  subscription   Subscription @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+  customer       Customer     @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  @@index([subscriptionId, startDate])
+  @@index([customerId, startDate])
+}
+
+model Pause {
+  id             Int          @id @default(autoincrement())
+  subscriptionId Int
+  startDate      DateTime
+  endDate        DateTime
+  createdAt      DateTime     @default(now())
+  subscription   Subscription @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+  @@index([subscriptionId, startDate, endDate])
+}
+
+model NotificationOutbox {
+  id         Int      @id @default(autoincrement())
+  type       String
+  customerId Int
+  phone      String
+  date       DateTime
+  message    String
+  createdAt  DateTime @default(now())
+  @@index([date])
+}
